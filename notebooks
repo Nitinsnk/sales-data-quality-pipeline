@@ -1,1 +1,359 @@
+# Databricks notebook source
+# Cell 1: Read raw CSVs with PySpark and write as Bronze Delta tables
+from pyspark.sql.functions import current_timestamp, lit
 
+base_path = "/Volumes/workspace/default/raw_sales_data"
+
+def load_bronze(file_name, table_name):
+    df = (spark.read
+          .option("header", "true")
+          .option("inferSchema", "true")
+          .csv(f"{base_path}/{file_name}")
+          .withColumn("_ingested_at", current_timestamp())
+          .withColumn("_source_file", lit(file_name)))
+
+    df.write.format("delta").mode("overwrite").saveAsTable(f"workspace.default.{table_name}")
+    print(f"{table_name}: {df.count()} rows written")
+    return df
+
+bronze_sales_df = load_bronze("sales_raw.csv", "bronze_sales")
+bronze_products_df = load_bronze("products.csv", "bronze_products")
+bronze_customers_df = load_bronze("customers.csv", "bronze_customers")
+bronze_channels_df = load_bronze("channels.csv", "bronze_channels")
+
+# COMMAND ----------
+
+# Cell 2: Quick sanity check
+display(bronze_sales_df.limit(10))
+
+# COMMAND ----------
+
+
+# Databricks notebook source
+# Cell 1: Read Bronze tables
+bronze_sales = spark.table("workspace.default.bronze_sales")
+bronze_products = spark.table("workspace.default.bronze_products")
+bronze_customers = spark.table("workspace.default.bronze_customers")
+bronze_channels = spark.table("workspace.default.bronze_channels")
+
+print("Bronze sales rows:", bronze_sales.count())
+
+# COMMAND ----------
+
+# Cell 2: Clean the sales data, logging what gets dropped at each step
+from pyspark.sql.functions import col, to_date, round as spark_round
+
+step0_count = bronze_sales.count()
+
+# Step 1: Remove exact duplicate sale_id rows (keep first occurrence)
+silver_sales = bronze_sales.dropDuplicates(["sale_id"])
+step1_count = silver_sales.count()
+print(f"Dropped {step0_count - step1_count} duplicate sale_id rows")
+
+# Step 2: Drop rows with nulls in critical numeric fields
+silver_sales = silver_sales.filter(col("unit_price").isNotNull() & col("units_sold").isNotNull())
+step2_count = silver_sales.count()
+print(f"Dropped {step1_count - step2_count} rows with null unit_price/units_sold")
+
+# Step 3: Drop rows with null channel
+silver_sales = silver_sales.filter(col("channel").isNotNull())
+step3_count = silver_sales.count()
+print(f"Dropped {step2_count - step3_count} rows with null channel")
+
+# Step 4: Fix data types
+silver_sales = (silver_sales
+    .withColumn("sale_date", to_date(col("sale_date"), "yyyy-MM-dd"))
+    .withColumn("units_sold", col("units_sold").cast("int"))
+    .withColumn("unit_price", spark_round(col("unit_price").cast("decimal(10,2)"), 2)))
+
+print(f"\nFinal Silver sales row count: {silver_sales.count()} (started with {step0_count})")
+
+# COMMAND ----------
+
+# Cell 3: Clean dimension tables (light touch — just dedupe on primary key)
+silver_products = bronze_products.dropDuplicates(["product_id"])
+silver_customers = bronze_customers.dropDuplicates(["customer_id"])
+silver_channels = bronze_channels.dropDuplicates(["channel"])
+
+print("Silver products:", silver_products.count())
+print("Silver customers:", silver_customers.count())
+print("Silver channels:", silver_channels.count())
+
+# COMMAND ----------
+
+# Cell 4: Write Silver Delta tables
+silver_sales.write.format("delta").mode("overwrite").saveAsTable("workspace.default.silver_sales")
+silver_products.write.format("delta").mode("overwrite").saveAsTable("workspace.default.silver_products")
+silver_customers.write.format("delta").mode("overwrite").saveAsTable("workspace.default.silver_customers")
+silver_channels.write.format("delta").mode("overwrite").saveAsTable("workspace.default.silver_channels")
+
+print("All 4 Silver tables written.")
+
+# COMMAND ----------
+
+
+# Databricks notebook source
+# Cell 1: Read Silver tables
+silver_sales = spark.table("workspace.default.silver_sales")
+silver_products = spark.table("workspace.default.silver_products")
+silver_customers = spark.table("workspace.default.silver_customers")
+silver_channels = spark.table("workspace.default.silver_channels")
+
+print("Silver sales rows:", silver_sales.count())
+
+# COMMAND ----------
+
+# Cell 2: Build dim_product, dim_customer, dim_channel
+from pyspark.sql.functions import monotonically_increasing_id
+
+dim_product = silver_products.select("product_id", "product_name", "category")
+dim_customer = silver_customers.select("customer_id", "customer_name", "region")
+
+dim_channel = (silver_channels
+    .withColumnRenamed("channel", "channel_name")
+    .withColumn("channel_id", monotonically_increasing_id() + 1))
+
+print("dim_product:", dim_product.count())
+print("dim_customer:", dim_customer.count())
+print("dim_channel:", dim_channel.count())
+dim_channel.show()
+
+# COMMAND ----------
+
+# Cell 3: Build dim_date from distinct sale dates
+from pyspark.sql.functions import col, year, month, quarter, dayofweek, date_format
+
+dim_date = (silver_sales.select(col("sale_date").alias("date_key")).distinct()
+    .withColumn("year", year("date_key"))
+    .withColumn("month", month("date_key"))
+    .withColumn("quarter", quarter("date_key"))
+    .withColumn("day_of_week", date_format("date_key", "EEEE")))
+
+print("dim_date:", dim_date.count())
+dim_date.orderBy("date_key").show(5)
+
+# COMMAND ----------
+
+# Cell 4: Build fact_sales via inner join — this is where broken FKs get caught
+step0_count = silver_sales.count()
+
+fact_sales = (silver_sales
+    .join(dim_product, on="product_id", how="inner")
+    .join(dim_customer, on="customer_id", how="inner")
+    .join(dim_channel.select("channel_name", "channel_id"), silver_sales["channel"] == dim_channel["channel_name"], how="inner")
+    .select(
+        "sale_id", "sale_date", "product_id", "customer_id", "channel_id",
+        "units_sold", "unit_price"
+    ))
+
+step1_count = fact_sales.count()
+print(f"Silver sales rows: {step0_count}")
+print(f"Fact_sales rows after join: {step1_count}")
+print(f"Dropped {step0_count - step1_count} rows with broken product/customer FK references")
+
+# COMMAND ----------
+
+# Cell 5: Write all Gold Delta tables
+dim_product.write.format("delta").mode("overwrite").saveAsTable("workspace.default.dim_product")
+dim_customer.write.format("delta").mode("overwrite").saveAsTable("workspace.default.dim_customer")
+dim_channel.write.format("delta").mode("overwrite").saveAsTable("workspace.default.dim_channel")
+dim_date.write.format("delta").mode("overwrite").saveAsTable("workspace.default.dim_date")
+fact_sales.write.format("delta").mode("overwrite").saveAsTable("workspace.default.fact_sales")
+
+print("All 5 Gold tables written: dim_product, dim_customer, dim_channel, dim_date, fact_sales")
+
+# COMMAND ----------
+
+
+# Databricks notebook source
+# Cell 1: Load all Gold + Bronze tables we need
+fact_sales = spark.table("workspace.default.fact_sales")
+dim_product = spark.table("workspace.default.dim_product")
+dim_customer = spark.table("workspace.default.dim_customer")
+dim_channel = spark.table("workspace.default.dim_channel")
+dim_date = spark.table("workspace.default.dim_date")
+
+bronze_sales = spark.table("workspace.default.bronze_sales")
+silver_sales = spark.table("workspace.default.silver_sales")
+
+scorecard_rows = []  # we'll append (check_name, status, details) tuples here
+
+# COMMAND ----------
+
+# Cell 2: Check 1 — Null rate per critical column in fact_sales
+from pyspark.sql.functions import col, sum as spark_sum, when, count
+
+critical_cols = ["sale_id", "product_id", "customer_id", "channel_id", "units_sold", "unit_price"]
+total_rows = fact_sales.count()
+
+for c in critical_cols:
+    null_count = fact_sales.filter(col(c).isNull()).count()
+    null_pct = round((null_count / total_rows) * 100, 2)
+    status = "PASS" if null_pct <= 1.0 else "FAIL"
+    scorecard_rows.append((f"Null rate: {c}", status, f"{null_count} nulls ({null_pct}%) out of {total_rows} rows"))
+    print(f"[{status}] {c}: {null_count} nulls ({null_pct}%)")
+
+# COMMAND ----------
+
+# Cell 3: Check 2 — Duplicate primary keys
+def check_duplicates(df, key_col, table_name):
+    total = df.count()
+    distinct = df.select(key_col).distinct().count()
+    dupes = total - distinct
+    status = "PASS" if dupes == 0 else "FAIL"
+    scorecard_rows.append((f"Duplicate PK: {table_name}", status, f"{dupes} duplicate {key_col} values found"))
+    print(f"[{status}] {table_name}: {dupes} duplicate {key_col} values")
+
+check_duplicates(fact_sales, "sale_id", "fact_sales")
+check_duplicates(dim_product, "product_id", "dim_product")
+check_duplicates(dim_customer, "customer_id", "dim_customer")
+check_duplicates(dim_channel, "channel_id", "dim_channel")
+
+# COMMAND ----------
+
+# Cell 4: Check 3 — Referential integrity (fact vs dimensions)
+def check_referential_integrity(fact_df, fk_col, dim_df, pk_col, dim_name):
+    orphans = fact_df.join(dim_df, fact_df[fk_col] == dim_df[pk_col], "left_anti").count()
+    status = "PASS" if orphans == 0 else "FAIL"
+    scorecard_rows.append((f"Referential integrity: {fk_col} -> {dim_name}", status, f"{orphans} orphan rows in fact_sales with no matching {dim_name}"))
+    print(f"[{status}] {fk_col} -> {dim_name}: {orphans} orphan rows")
+
+check_referential_integrity(fact_sales, "product_id", dim_product, "product_id", "dim_product")
+check_referential_integrity(fact_sales, "customer_id", dim_customer, "customer_id", "dim_customer")
+check_referential_integrity(fact_sales, "channel_id", dim_channel, "channel_id", "dim_channel")
+
+# COMMAND ----------
+
+# Cell 5: Check 4 — Row-count reconciliation across Bronze -> Silver -> Gold
+bronze_count = bronze_sales.count()
+silver_count = silver_sales.count()
+gold_count = fact_sales.count()
+
+dropped_bronze_to_silver = bronze_count - silver_count
+dropped_silver_to_gold = silver_count - gold_count
+
+scorecard_rows.append(("Row count reconciliation: Bronze->Silver", "INFO",
+                        f"{bronze_count} -> {silver_count} ({dropped_bronze_to_silver} dropped: dupes/nulls)"))
+scorecard_rows.append(("Row count reconciliation: Silver->Gold", "INFO",
+                        f"{silver_count} -> {gold_count} ({dropped_silver_to_gold} dropped: broken FKs)"))
+
+print(f"Bronze: {bronze_count} -> Silver: {silver_count} -> Gold: {gold_count}")
+print(f"Dropped in Silver (dupes/nulls): {dropped_bronze_to_silver}")
+print(f"Dropped in Gold (broken FKs): {dropped_silver_to_gold}")
+
+# COMMAND ----------
+
+# Cell 6: Build and save the final Quality Scorecard
+from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.functions import current_timestamp
+
+schema = StructType([
+    StructField("check_name", StringType(), True),
+    StructField("status", StringType(), True),
+    StructField("details", StringType(), True),
+])
+
+scorecard_df = spark.createDataFrame(scorecard_rows, schema).withColumn("checked_at", current_timestamp())
+
+scorecard_df.write.format("delta").mode("overwrite").saveAsTable("workspace.default.dq_scorecard")
+
+print("\n=== DATA QUALITY SCORECARD ===")
+display(scorecard_df)
+
+# COMMAND ----------
+
+
+# Databricks notebook source
+# DBTITLE 1,# Cell 1: Install Faker (Free Edition doesn't have it pre-installed) %pip install faker
+# Cell 1: Install Faker (Free Edition doesn't have it pre-installed)
+%pip install faker
+
+# COMMAND ----------
+
+# Cell (run once after installing faker)
+dbutils.library.restartPython()
+
+# COMMAND ----------
+
+import random
+from datetime import datetime, timedelta
+from faker import Faker
+import pandas as pd
+
+fake = Faker()
+random.seed(42)
+Faker.seed(42)
+
+channels = ["Wholesale", "Dealership", "Online", "Retail Partner"]
+
+products = []
+for i in range(1, 31):
+    pid = "P" + str(i).zfill(3)
+    pname = fake.word().capitalize() + " " + random.choice(["Sedan", "SUV", "Truck", "Coupe", "Hatchback"])
+    category = random.choice(["Compact", "Luxury", "Commercial", "Electric"])
+    products.append({"product_id": pid, "product_name": pname, "category": category})
+
+customers = []
+for i in range(1, 201):
+    cid = "C" + str(i).zfill(4)
+    cname = fake.company()
+    region = fake.state()
+    customers.append({"customer_id": cid, "customer_name": cname, "region": region})
+
+start_date = datetime(2023, 1, 1)
+end_date = datetime(2026, 9, 1)
+
+def random_date():
+    delta = end_date - start_date
+    return start_date + timedelta(days=random.randint(0, delta.days))
+
+rows = []
+n_rows = 12000
+for i in range(n_rows):
+    product = random.choice(products)
+    customer = random.choice(customers)
+    row = {}
+    row["sale_id"] = "S" + str(i).zfill(6)
+    row["sale_date"] = random_date().strftime("%Y-%m-%d")
+    row["product_id"] = product["product_id"]
+    row["customer_id"] = customer["customer_id"]
+    row["channel"] = random.choice(channels)
+    row["units_sold"] = random.randint(1, 50)
+    row["unit_price"] = round(random.uniform(15000, 85000), 2)
+
+    r = random.random()
+    if r < 0.03:
+        row["product_id"] = "P" + str(random.randint(900, 999))
+    elif r < 0.05:
+        row["customer_id"] = "C" + str(random.randint(9000, 9999))
+    elif r < 0.08:
+        row["unit_price"] = None
+    elif r < 0.10:
+        row["units_sold"] = None
+    elif r < 0.12:
+        row["channel"] = None
+
+    rows.append(row)
+
+sales_df = pd.DataFrame(rows)
+dupes = sales_df.sample(frac=0.02, random_state=1).copy()
+sales_df = pd.concat([sales_df, dupes], ignore_index=True)
+
+products_df = pd.DataFrame(products)
+customers_df = pd.DataFrame(customers)
+channels_df = pd.DataFrame({"channel": channels})
+
+print("Sales rows:", len(sales_df))
+print("Products:", len(products_df), "Customers:", len(customers_df))
+sales_df.head()
+
+# COMMAND ----------
+
+base_path = "/Volumes/workspace/default/raw_sales_data"
+
+sales_df.to_csv(f"{base_path}/sales_raw.csv", index=False)
+products_df.to_csv(f"{base_path}/products.csv", index=False)
+customers_df.to_csv(f"{base_path}/customers.csv", index=False)
+channels_df.to_csv(f"{base_path}/channels.csv", index=False)
+
+print("Saved 4 CSV files to:", base_path)
